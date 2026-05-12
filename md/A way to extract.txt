@@ -1,0 +1,196 @@
+Here is end-to-end what happens in the Generic template workbench (the new section at the bottom of the /test page) from upload → middle → export. I'll match the steps to the actual code on extract/ready-pttx.
+
+1) Upload — extractTemplate(file)
+When you click Upload .pptx and pick a file, the client posts it as multipart to the server:
+
+
+client.ts
+Lines 87-96
+export async function extractTemplate(file: File): Promise<TemplateAnalysis> {
+  const fd = new FormData();
+  fd.append('template', file);
+  const res = await fetch(apiUrl('/extract-template'), {
+    method: 'POST',
+    body: fd,
+  });
+  return parseJsonResponse<TemplateAnalysis>(res, '/extract-template');
+}
+The server route checks size (15MB cap) and PPTX magic bytes, then hands the buffer to analyzeTemplateFromPptx:
+
+
+extract-template.ts
+Lines 11-32
+router.post('/extract-template', upload.single('template'), async (req, res) => {
+  // ...validation...
+  const data = await analyzeTemplateFromPptx(file.buffer);
+  res.json({ success: true, data });
+});
+analyzeTemplateFromPptx uses pptx-automizer to read the file as an in-memory Buffer (no disk write of the original) and walks every slide:
+
+It reads the slide size from ppt/presentation.xml.
+For every shape on every slide it captures: name, creationId, geometry in EMU + inches, visual type, placeholderType, sample text, paragraph styling, alt text.
+It runs two classifiers:
+detectTextRole → guesses the text role per shape (title, body, etc.).
+classifySlideLayout → guesses one of your 7 layout types (title, content, two-column, …) and a confidence score.
+For each shape it decides:
+kind (text / image / shape / chart / table / group)
+decorative (tiny things, lines, very small non-text shapes — these are skipped on export)
+editable (only text with body, image placeholders, chart, or table, and not decorative / footer / slide number)
+Every editable shape gets a stable slotId like slot-s3-i7-AB12CD34 (slide #, shape index, first 8 chars of creationId).
+The response is a TemplateAnalysis containing slideWidthEmu/HeightEmu, slideAspectRatio, and one TemplateLayoutSpec per source slide with its full elements[] and slotIds[] arrays.
+
+Back in the UI, that analysis is rendered as an "Extraction preview" — one box per source slide showing the detected slots and an overlay (TemplateSlidePreview), with an "Element list" toggle for the raw slot metadata.
+
+2) "Something in the middle (all)" — the three optional/required steps
+Between upload and export there are three actions in TemplateWorkbench.tsx:
+
+a) Label layouts (LLM) — optional
+
+TemplateWorkbench.tsx
+Lines 58-70
+const runLabel = useCallback(async () => {
+  if (!analysis) return;
+  setPhase('labeling');
+  // ...
+  const next = await analyzeTemplateLayouts(analysis);
+  setAnalysis(next);
+  // ...
+}, [analysis]);
+Calls POST /api/analyze-template-layouts. The server sends a compact version of the analysis to Gemini (only ids, sample text, roles, no geometry) and asks for {llmName, llmPurpose: 'cover'|'content'|'comparison'|'data'|'closing'|'other', llmNotes} per layout. Those fields are merged in so the rest of the pipeline gets nicer names (previewName is replaced too). This step is purely cosmetic/semantic — if it fails the analysis is returned unchanged (server/src/services/template-analyzer.ts).
+
+b) Plan deck (LLM) — required before export
+
+TemplateWorkbench.tsx
+Lines 72-89
+const runPlan = useCallback(async () => {
+  if (!analysis || !userPrompt.trim()) return;
+  setPhase('planning');
+  // ...
+  const plan = await templateNativePlan({
+    userPrompt: userPrompt.trim(),
+    analysis,
+    slideCount: slideCount === 'auto' ? 'auto' : slideCount,
+  });
+  setDeckPlan(plan);
+  setSlideContents(Array(plan.slides.length).fill(null));
+  // ...
+}, [analysis, userPrompt, slideCount]);
+Calls POST /api/template-plan → createTemplateDeckPlan. The LLM only sees the layout id + label + purpose list. The system prompt forces it to:
+
+choose templateLayoutId strictly from your file's layouts,
+produce exactly N slides (default 3–10, clamped),
+give each slide a briefing (intent, not final copy).
+Result: a TemplateDeckPlan like { title, slides: [{ index, templateLayoutId, briefing }] }. The UI shows it as a numbered list of layoutId → briefing.
+
+c) Generate all slide copy (LLM) — the "extract … (all)" step
+
+TemplateWorkbench.tsx
+Lines 91-123
+const runGenerateAll = useCallback(async () => {
+  if (!analysis || !deckPlan) return;
+  // ...
+  const tasks = deckPlan.slides.map(
+    (_, idx) => () =>
+      withRetry(() =>
+        templateGenerateSlide({
+          userPrompt: userPrompt.trim(),
+          analysis,
+          deckPlan,
+          slideIndex: idx,
+        })
+      )
+  );
+  await runWithConcurrency(tasks, 3, ...);
+  // ...
+}, [analysis, deckPlan, userPrompt]);
+For each planned slide it fires POST /api/template-generate-slide in parallel — concurrency 3, up to 2 retries each (same concurrency model as the main app). The server picks the matching layout, builds a "slot digest" containing only slotId, role, kind, hint(samples) for editable slots, and asks Gemini for:
+
+{ "slotAssignments": { "<slotId>": "<plain text>" } }
+If the layout has zero editable slots, it returns immediately with a warning instead of calling the LLM. If the LLM fails, it falls back to dumping the briefing into every slot (server/src/services/template-slide-generator.ts).
+
+After this step each item in slideContents[] is a TemplateSlideContent with the final text per slot. The "Generated X / Y" counter and the Export button gate on allSlidesGenerated.
+
+3) Export native .pptx — exportTemplateNativePptx
+
+TemplateWorkbench.tsx
+Lines 130-151
+const runExport = useCallback(async () => {
+  if (!templateFile || !analysis || !deckPlan || !allSlidesGenerated) return;
+  // ...
+  const slides = deckPlan.slides.map((item, idx) => {
+    const layout = analysis.layouts.find((l) => l.id === item.templateLayoutId);
+    const content = slideContents[idx]!;
+    return {
+      sourceSlideNumber: layout?.slideNumber ?? 1,
+      templateLayoutId: item.templateLayoutId,
+      slotAssignments: content.slotAssignments,
+    };
+  });
+  await exportTemplateNativePptx(templateFile, { title: deckPlan.title, slides }, analysis);
+  // ...
+}, [templateFile, analysis, deckPlan, slideContents, allSlidesGenerated]);
+The client re-uploads three things together as multipart: the original .pptx, the presentation JSON (title + slides with sourceSlideNumber + slotAssignments), and the analysis JSON. This is critical — the server doesn't keep your file from upload step 1; the browser holds it and sends it again here.
+
+Server side, exportTemplateNativePresentation does the work with pptx-automizer:
+
+
+template-native-export.ts
+Lines 40-99
+export async function exportTemplateNativePresentation(
+  templateBuffer: Buffer,
+  presentation: TemplateNativePresentation,
+  analysis: TemplateAnalysis,
+): Promise<{ buffer: Buffer; filename: string }> {
+  // ...
+  const automizer = new Automizer({
+    outputDir: tmpDir,
+    templateDir: tmpDir,
+    rootTemplate: rootBuf,
+    removeExistingSlides: true,
+    autoImportSlideMasters: true,
+    cleanup: true,
+    pptxGenJs,
+  });
+  automizer.load(loadBuf, 'user');
+  // ...
+  for (const slide of presentation.slides) {
+    // ...
+    automizer.addSlide('user', slide.sourceSlideNumber, (islide) => {
+      for (const [slotId, text] of Object.entries(slide.slotAssignments)) {
+        const spec = findSpec(analysis, slide.templateLayoutId, slotId);
+        if (!spec) continue;
+        if (!spec.editable || spec.decorative) continue;
+        if (spec.kind !== 'text') {
+          continue;
+        }
+        const selector = toFindSelector(spec);
+        const mods = [ModifyTextHelper.setText(text)];
+        try {
+          islide.modifyElement(selector as string | TemplateElementSelector, mods);
+        } catch {
+          try {
+            islide.modifyElement(spec.selector.name, mods);
+          } catch {
+            /* ignore missing shape */
+          }
+        }
+      }
+    });
+  }
+What's happening, in plain English:
+
+Root template + loaded template are the same buffer: pptx-automizer uses your uploaded file as both the "shell" (master slides, theme, slide size, fonts, layouts) and the "source" of slides to clone. removeExistingSlides: true strips the source slides out of the shell so you start with an empty deck that still has all the master/layout/theme assets.
+For each entry in your presentation.slides, it calls addSlide('user', sourceSlideNumber, ...) which clones that exact source slide into the output, preserving every shape, image, chart, gradient, decorative element, master reference — pixel-identical to the original.
+Inside the modify callback it walks slotAssignments, looks up the TemplateElementSpec for that slotId in the analysis, and filters strictly:
+skip if not found,
+skip if editable === false or decorative === true,
+skip if kind !== 'text' (this is the v1 limitation — images/charts/tables are kept exactly as in the template but cannot be replaced yet).
+It builds an automizer selector preferring creationId (wrapped in {...}) and falling back to name. If the creationId selector fails, it retries with just the name. Failures past that are swallowed — a missing shape doesn't kill the export.
+ModifyTextHelper.setText(text) replaces the text run while keeping the placeholder's existing run properties (font, size, color), which is why your branding survives.
+The result is written to a temp file, read back into a Buffer, the temp file is deleted, and the buffer is sent back with Content-Type: …presentationml.presentation and a safe filename (Hebrew is allowed too — [^a-zA-Z0-9\u0590-\u05FF\s-] is stripped).
+On the client, exportTemplateNativePptx builds an object URL from the blob and triggers a browser download named <title>-native.pptx.
+
+Summary of what's special about this pipeline vs the main app
+The main /api/plan + /api/generate-slide flow generates abstract slide data (SlideData unions) and the client renders the .pptx with PptxGenJS from theme + layout masters.
+The workbench flow inverts that: extraction reads your real .pptx, plan and generation only emit slot text, and export happens on the server by cloning your slides and editing text in place — your template is the renderer.
+Trade-off (v1, encoded in the type filter on export): only kind === 'text' slots get rewritten. Images, charts, tables, decorative shapes pass through unchanged from the source slide. The analysis already marks them editable so they show up in the slot list, but template-native-export.ts currently no-ops them with the comment "text injection only in v1" mirrored in the workbench's intro text.
